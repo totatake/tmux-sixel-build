@@ -1,0 +1,127 @@
+name: Build Static tmux with Sixel
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create a GitHub Release for this build'
+        required: false
+        type: boolean
+        default: false
+      release_tag:
+        description: 'Tag name for GitHub Release (e.g. v3.5a-sixel)'
+        required: false
+        type: string
+        default: ''
+  push:
+    branches:
+      - build-sixel
+    tags:
+      - '*sixel-build'
+  pull_request:
+    branches:
+      - build-sixel
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build static tmux (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu 22.04 x86_64
+            runner: ubuntu-22.04
+            arch: linux-x86_64
+          - name: Ubuntu 22.04 aarch64
+            runner: ubuntu-22.04-arm
+            arch: linux-aarch64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf \
+            automake \
+            bison \
+            build-essential \
+            libevent-dev \
+            libncurses-dev \
+            pkg-config
+
+      - name: Configure and build tmux
+        run: |
+          sh autogen.sh
+          ./configure --enable-sixel --enable-static
+          make -j"$(nproc)"
+
+      - name: Verify binary
+        run: |
+          echo "=== Check File Type (Static Link Check) ==="
+          file tmux
+          echo "=== Dynamic Link Check (ldd should report 'not a dynamic executable') ==="
+          ldd tmux || true
+          echo "=== tmux Version ==="
+          ./tmux -V
+
+      - name: Package artifacts
+        run: |
+          # Strip debug symbols to reduce binary size
+          strip tmux
+          mkdir -p dist
+          tar -czvf "dist/tmux-sixel-static-${{ matrix.arch }}.tar.gz" tmux
+          cd dist
+          sha256sum "tmux-sixel-static-${{ matrix.arch }}.tar.gz" > "tmux-sixel-static-${{ matrix.arch }}.tar.gz.sha256"
+          cd ..
+
+      - name: Upload artifact to GitHub Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: tmux-sixel-static-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.create_release)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Determine release tag
+        id: release_info
+        run: |
+          if [ "${{ startsWith(github.ref, 'refs/tags/') }}" = "true" ]; then
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+          elif [ -n "${{ inputs.release_tag }}" ]; then
+            TAG_NAME="${{ inputs.release_tag }}"
+          else
+            TAG_NAME="build-$(date +'%Y%m%d-%H%M%S')"
+          fi
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_info.outputs.tag_name }}
+          name: "tmux (Static + Sixel) ${{ steps.release_info.outputs.tag_name }}"
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+
